@@ -2,6 +2,7 @@ import os
 import time
 import json
 import threading
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -74,6 +75,7 @@ def listen_lob():
     Connects to BitMEX LOB WS and updates latest emitted snapshot.
     """
     global lob_snapshot
+    order_book = {}
 
     while True:
         try:
@@ -84,18 +86,50 @@ def listen_lob():
 
                 if data.get("table") == "orderBookL2":
                     with lock:
-                        if data["action"] == "partial":
-                            bids = []
-                            asks = []
+                        for entry in data["data"]:
+                            action = data["action"]
+                            order_id = entry["id"]
 
-                            for entry in data["data"]:
-                                if entry["side"] == "Buy":
-                                    bids.append([entry["price"], entry["size"]])
+                            if action == "partial":
+                                order_book.clear()
 
-                                else:
-                                    asks.append([entry["price"], entry["size"]])
+                                for e in data["data"]:
+                                    order_book[e["id"]] = {
+                                        "price": e["price"],
+                                        "size": e["size"],
+                                        "side": e["side"]
+                                    }
 
-                            lob_snapshot = {"bids": bids, "asks": asks}
+                            elif action == "insert":
+                                order_book[order_id] = {
+                                    "price": entry["price"],
+                                    "size": entry["size"],
+                                    "side": entry["side"]
+                                }
+
+                            elif action == "update":
+                                if order_id in order_book:
+                                    order_book[order_id]["size"] = entry["size"]
+
+                            elif action == "delete":
+                                order_book.pop(order_id, None)
+
+                        # Rebuilds snapshot
+                        bids = []
+                        asks = []
+
+                        for o in order_book.values():
+                            if o["side"] == "Buy":
+                                bids.append([o["price"], o["size"]])
+
+                            else:
+                                asks.append([o["price"], o["size"]])
+
+                        # Sorts price levels
+                        bids.sort(key=lambda x: -x[0]) # descending
+                        asks.sort(key=lambda x: x[0]) # ascending
+
+                        lob_snapshot = {"bids": bids, "asks": asks}
 
         except Exception as e:
             print(f"LOB WebSocket error: {e}. Reconnecting in 5 seconds...")
@@ -132,7 +166,7 @@ def record_snapshot():
 
                 if recent_trades:
                     last_price = recent_trades[-1]["price"]
-                    volume = sum(t["size"] for t in recent_trades)
+                    volume = float(sum(t["size"] for t in recent_trades))
 
                 else:
                     last_price = None
@@ -154,8 +188,8 @@ def record_snapshot():
                     [
                         {   
                             "timestamp": get_timestamp(),
-                            "last_price": last_price,
-                            "volume": volume
+                            "last_price": float(last_price) if last_price is not None else np.nan,
+                            "volume": float(volume)
                         }
                     ]
                 )
