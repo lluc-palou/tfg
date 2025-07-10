@@ -1,6 +1,8 @@
 import os
+import re
 import time
 import json
+import shutil
 import threading
 import numpy as np
 import pandas as pd
@@ -135,6 +137,23 @@ def listen_lob():
             print(f"LOB WebSocket error: {e}. Reconnecting in 5 seconds...")
             time.sleep(5)
 
+def generate_backup_filepath(filepath):
+    """
+    Given a Parquet filepath, returns the next available numbered backup path.
+    """
+    base, ext = os.path.splitext(filepath)
+    pattern = re.compile(re.escape(base) + r'_(\d+)' + re.escape(ext))
+    
+    # Looks for existing backups
+    existing_backups = [
+        int(m.group(1)) for f in os.listdir(os.path.dirname(filepath))
+        if (m := pattern.fullmatch(f))
+    ]
+
+    next_index = max(existing_backups, default=0) + 1
+    
+    return f"{base}_{next_index}{ext}"
+
 def append_to_parquet(filepath, df):
     """
     Given current filepath saves both LOB snapshot and trade summary outputs using Parquet file format.
@@ -143,11 +162,20 @@ def append_to_parquet(filepath, df):
 
     if not os.path.exists(filepath):
         pq.write_table(table, filepath)
-
-    else:
+        return
+    
+    try:
         existing_table = pq.read_table(filepath)
         combined = pa.concat_tables([existing_table, table])
-        pq.write_table(combined, filepath)
+    
+    except (pa.lib.ArrowInvalid, OSError) as e:
+        print(f"Warning: Corrupted or invalid Parquet file at {filepath}. Reason: {e}")
+        backup_path = generate_backup_filepath(filepath)
+        os.rename(filepath, backup_path)
+        print(f"Corrupted or invalid Parquet file has been moved to: {backup_path}")
+        combined = table
+
+    pq.write_table(combined, filepath)
 
 def record_snapshot():
     """
@@ -220,7 +248,7 @@ if __name__ == "__main__":
     try:
         while True:
             # Prevents the script from exiting execution
-            time.sleep(60)
+            time.sleep(120)
 
     except KeyboardInterrupt:
         print("Data collection stopped")
