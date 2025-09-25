@@ -2,33 +2,27 @@ import os
 import re
 import time
 import json
-import shutil
 import threading
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime, timezone
 from websocket import create_connection, WebSocketConnectionClosedException
 
-# BitMEX WS (WebSocket) endpoints
+# BitMEX LOB WebSocket endpoint
 LOB_WS_URL = "wss://www.bitmex.com/realtime?subscribe=orderBookL2:XBTUSD"
-TRADE_WS_URL = "wss://www.bitmex.com/realtime?subscribe=trade:XBTUSD"
 
-# Buffers to store incoming trades and order book updates
-trades_buffer = []
+# LOB snapshot storage
 lob_snapshot = None
 lock = threading.Lock()
 
-# Output directories
+# Output directory
 LOB_OUTPUT_DIR = "lob_data"
-TRADE_OUTPUT_DIR = "trade_data"
 os.makedirs(LOB_OUTPUT_DIR, exist_ok=True)
-os.makedirs(TRADE_OUTPUT_DIR, exist_ok=True)
 
 def get_timestamp():
     """
-    Returns current day timestamp.
+    Returns current timestamp in ISO format.
     """
     return datetime.now(timezone.utc).isoformat()
 
@@ -39,42 +33,9 @@ def get_lob_output_file():
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return os.path.join(LOB_OUTPUT_DIR, f"{date_str}.parquet")
 
-def get_trade_output_file():
-    """
-    Returns current day trade summary filepath.
-    """
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return os.path.join(TRADE_OUTPUT_DIR, f"{date_str}.parquet")
-
-def listen_trades():
-    """
-    Connects to BitMEX trade WS and collects incoming live trade events.
-    """
-    while True:
-        try:
-            ws = create_connection(TRADE_WS_URL)
-
-            while True:
-                data = json.loads(ws.recv())
-
-                if data.get("table") == "trade":
-                    with lock:
-                        for trade in data["data"]:
-                            trades_buffer.append(
-                                {
-                                    "timestamp": trade["timestamp"],
-                                    "price": trade["price"],
-                                    "size": trade["size"]
-                                }
-                            )
-
-        except Exception as e:
-            print(f"Trade WebSocket error: {e}. Reconnecting in 5 seconds...")
-            time.sleep(5)
-
 def listen_lob():
     """
-    Connects to BitMEX LOB WS and updates latest emitted snapshot.
+    Connects to BitMEX LOB WebSocket and maintains current order book snapshot.
     """
     global lob_snapshot
     order_book = {}
@@ -82,81 +43,84 @@ def listen_lob():
     while True:
         try:
             ws = create_connection(LOB_WS_URL)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Connected to BitMEX LOB WebSocket")
 
             while True:
                 data = json.loads(ws.recv())
 
                 if data.get("table") == "orderBookL2":
                     with lock:
-                        for entry in data["data"]:
-                            action = data["action"]
-                            order_id = entry["id"]
+                        action = data["action"]
 
-                            if action == "partial":
-                                order_book.clear()
-
-                                for e in data["data"]:
-                                    order_book[e["id"]] = {
-                                        "price": e["price"],
-                                        "size": e["size"],
-                                        "side": e["side"]
-                                    }
-
-                            elif action == "insert":
-                                order_book[order_id] = {
+                        if action == "partial":
+                            # Full snapshot - rebuild entire order book
+                            order_book.clear()
+                            for entry in data["data"]:
+                                order_book[entry["id"]] = {
                                     "price": entry["price"],
                                     "size": entry["size"],
                                     "side": entry["side"]
                                 }
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] LOB snapshot initialized with {len(order_book)} levels")
 
-                            elif action == "update":
-                                if order_id in order_book:
-                                    order_book[order_id]["size"] = entry["size"]
+                        else:
+                            # Incremental updates
+                            for entry in data["data"]:
+                                order_id = entry["id"]
 
-                            elif action == "delete":
-                                order_book.pop(order_id, None)
+                                if action == "insert":
+                                    order_book[order_id] = {
+                                        "price": entry["price"],
+                                        "size": entry["size"],
+                                        "side": entry["side"]
+                                    }
 
-                        # Rebuilds snapshot
+                                elif action == "update":
+                                    if order_id in order_book:
+                                        order_book[order_id]["size"] = entry["size"]
+
+                                elif action == "delete":
+                                    order_book.pop(order_id, None)
+
+                        # Rebuild sorted bids/asks arrays
                         bids = []
                         asks = []
 
-                        for o in order_book.values():
-                            if o["side"] == "Buy":
-                                bids.append([o["price"], o["size"]])
-
+                        for order in order_book.values():
+                            if order["side"] == "Buy":
+                                bids.append([order["price"], order["size"]])
                             else:
-                                asks.append([o["price"], o["size"]])
+                                asks.append([order["price"], order["size"]])
 
-                        # Sorts price levels
-                        bids.sort(key=lambda x: -x[0]) # descending
-                        asks.sort(key=lambda x: x[0]) # ascending
+                        # Sort price levels: bids descending, asks ascending
+                        bids.sort(key=lambda x: -x[0])
+                        asks.sort(key=lambda x: x[0])
 
                         lob_snapshot = {"bids": bids, "asks": asks}
 
         except Exception as e:
-            print(f"LOB WebSocket error: {e}. Reconnecting in 5 seconds...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] LOB WebSocket error: {e}. Reconnecting in 5 seconds...")
             time.sleep(5)
 
 def generate_backup_filepath(filepath):
     """
-    Given a Parquet filepath, returns the next available numbered backup path.
+    Generate backup filepath with incremental numbering.
     """
     base, ext = os.path.splitext(filepath)
     pattern = re.compile(re.escape(base) + r'_(\d+)' + re.escape(ext))
     
-    # Looks for existing backups
+    # Find existing backup numbers
     existing_backups = [
         int(m.group(1)) for f in os.listdir(os.path.dirname(filepath))
         if (m := pattern.fullmatch(f))
     ]
 
     next_index = max(existing_backups, default=0) + 1
-    
     return f"{base}_{next_index}{ext}"
 
 def append_to_parquet(filepath, df):
     """
-    Given current filepath saves both LOB snapshot and trade summary outputs using Parquet file format.
+    Append DataFrame to Parquet file, handling corruption gracefully.
     """
     table = pa.Table.from_pandas(df)
 
@@ -167,88 +131,89 @@ def append_to_parquet(filepath, df):
     try:
         existing_table = pq.read_table(filepath)
         combined = pa.concat_tables([existing_table, table])
+        pq.write_table(combined, filepath)
     
     except (pa.lib.ArrowInvalid, OSError) as e:
-        print(f"Warning: Corrupted or invalid Parquet file at {filepath}. Reason: {e}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Warning: Corrupted Parquet file at {filepath}. Reason: {e}")
         backup_path = generate_backup_filepath(filepath)
         os.rename(filepath, backup_path)
-        print(f"Corrupted or invalid Parquet file has been moved to: {backup_path}")
-        combined = table
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Corrupted file moved to: {backup_path}")
+        pq.write_table(table, filepath)
 
-    pq.write_table(combined, filepath)
-
-def record_snapshot():
+def record_snapshots():
     """
-    Saves the current LOB snapshot and trade summary separately.
+    Records LOB snapshots every 30 seconds to Parquet files.
     """
+    snapshot_count = 0
+    
     while True:
-        # LOB snapshot sampling period
+        # Wait 30 seconds before taking snapshot
         time.sleep(30)
-
+        
         with lock:
             if lob_snapshot:
-                # Computes total volume over sampling period
-                now = datetime.now(timezone.utc)
-                cutoff = now.timestamp() - 30
-                recent_trades = [t for t in trades_buffer if datetime.strptime(t["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp() >= cutoff]
+                # Create LOB snapshot record
+                timestamp = get_timestamp()
+                
+                lob_df = pd.DataFrame([{
+                    "timestamp": timestamp,
+                    "bids": json.dumps(lob_snapshot["bids"]),
+                    "asks": json.dumps(lob_snapshot["asks"])
+                }])
 
-                if recent_trades:
-                    last_price = recent_trades[-1]["price"]
-                    volume = float(sum(t["size"] for t in recent_trades))
-
-                else:
-                    last_price = None
-                    volume = 0.0
-
-                # LOB snapshot
-                lob_df = pd.DataFrame(
-                    [
-                        {   
-                            "timestamp": get_timestamp(),
-                            "bids": json.dumps(lob_snapshot["bids"]),
-                            "asks": json.dumps(lob_snapshot["asks"])
-                        }
-                    ]
-                )
-
-                # Trade summary
-                trade_df = pd.DataFrame(
-                    [
-                        {   
-                            "timestamp": get_timestamp(),
-                            "last_price": float(last_price) if last_price is not None else np.nan,
-                            "volume": float(volume)
-                        }
-                    ]
-                )
-
-                # Obtains current file
+                # Save to Parquet file
                 lob_file = get_lob_output_file()
-                trade_file = get_trade_output_file()
-
-                # Appends data to the corresponding file
                 append_to_parquet(lob_file, lob_df)
-                append_to_parquet(trade_file, trade_df)
+                
+                snapshot_count += 1
+                
+                # Calculate bid-ask spread for logging
+                if lob_snapshot["bids"] and lob_snapshot["asks"]:
+                    best_bid = lob_snapshot["bids"][0][0]
+                    best_ask = lob_snapshot["asks"][0][0]
+                    spread = best_ask - best_bid
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Snapshot #{snapshot_count} saved. "
+                          f"Bid: {best_bid}, Ask: {best_ask}, Spread: {spread:.2f}")
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Snapshot #{snapshot_count} saved (empty book)")
+            
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] No LOB snapshot available yet, waiting...")
 
-                # Cleans up old sampling period trades
-                trades_buffer.clear()
-
-def start_recording():
+def start_collection():
     """
-    Initializes and starts all working threads.
+    Initialize and start LOB collection threads.
     """
-    threading.Thread(target=listen_trades, daemon=True).start()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting LOB data collection...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Output directory: {os.path.abspath(LOB_OUTPUT_DIR)}")
+    
+    # Start LOB WebSocket listener
     threading.Thread(target=listen_lob, daemon=True).start()
-    threading.Thread(target=record_snapshot, daemon=True).start()
+    
+    # Start snapshot recorder
+    threading.Thread(target=record_snapshots, daemon=True).start()
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Collection threads started. Taking snapshots every 30 seconds.")
 
 if __name__ == "__main__":
-    # Starts the data collection system
-    start_recording()
+    # Start the LOB collection system
+    start_collection()
 
     try:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] LOB collection running. Press Ctrl+C to stop.")
         while True:
-            # Prevents the script from exiting execution
-            time.sleep(120)
+            # Keep main thread alive and show status every 10 minutes
+            time.sleep(600)  # 10 minutes
+            
+            # Show current file info
+            current_file = get_lob_output_file()
+            if os.path.exists(current_file):
+                file_size = os.path.getsize(current_file)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Status: {current_file} - {file_size/1024/1024:.2f}MB")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Status: No data file created yet")
 
     except KeyboardInterrupt:
-        print("Data collection stopped")
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] LOB data collection stopped by user")
+    except Exception as e:
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Collection stopped due to error: {e}")
